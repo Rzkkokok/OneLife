@@ -3,9 +3,64 @@ This file only list changes to game code.  Changes to content can be found here:
 http://onehouronelife.com/updateLog.php
 
 
-Version 200     ????
+Version 201    ???
+
+--Client prints stat about fraction of total sprites loaded.
+
+--Dramatic speed up to client load time.  Pre-loading all sprites before LOGIN
+  screen shown from a single compressed cache file (used to load sprites from
+  separate files as-needed at map load time).  Now map loads almost instantly.
+
+
+
+Server Fixes
+
+--Fixed crash caused by wayward deletion of new sequence number string in twin
+  code.
+
+--Fixed clothing biome boundary dancing exploit (crossing boundary between
+  hot/cold biome will never make you more comfortable (closer to target middle
+  temp) than you were before crossing).  Clothing still reduces thermal shock
+  from crossing biome boundaries, but only if you are already closer to target
+  temp than thermal shock on other side of temp meter.  So if you are close to
+  perfect, wearing clothing will help a lot when you cross a biome boundary
+  from cold to hot.  If you are currently freezing (and in clothes), the
+  clothing won't help much when you cross into a hot biome to reduce shock.
+
+--Body heat now only applies in cold environments, so it won't cause
+  overheating when wearing clothes in hot environments (clothes slow how fast
+  you heat up in the hot environment, but don't hurt you by making you even
+  hotter after you acclimate).
+
+--If client sends malformed message, we now disconnect them instead of killing
+  them.  Related to #194.
+
+--If client sends more than 200 character without sending a message terminator,
+  we treat this as a malformed message (to prevent a rogue client from filling
+  up the buffer on the server).
+
+--/DIE command now works even if you're not held, and clears mother's birth
+  cooldown if she ever picked up up at least once.  Fixes #194
+
+--/DIE command now works up to age 2, to compensate for slow map load times on
+  some machines.
+
+--Donkeytown threshold (which was fixed at a current curse score of 8 before)
+  now goes down as a player's total curse score rises.  Once they hit 25 total
+  points, it goes down to 7.  At 55, it goes down to 6.  At 65 down to 4.  And
+  75 down to 3.  Note that there are only 27 people in the game with a total
+  curse score of 55 or more.  A very tiny sliver of the total player
+  population.  So, we now wait for the worst players to anger fewer people
+  before sending them to Donkeytown.  Fixes #204
+
+
+
+
+Version 199     2019-February-15
 
 --Scene editor allows copy/paste of area containing floor and people.
+
+--Updated tutorial to explain new heat system.
 
 
 
@@ -130,6 +185,22 @@ Server Fixes
   much more intuitive than old system.  Biome heat contribution is also added
   int from player's position as a final step, so there's no biome boundary
   blending. 
+
+--Heat overhaul:  moving to a temperature-affecting biome that is on the
+  opposite side of "perfect" from you results in an instantaneous temperature
+  shock, jumping to that side of the temp meter instead of tweening there
+  through perfect.  This makes biome-boundary-dancing ineffective.  This
+  effect is modulated by clothing though (it reduces the shock of stepping
+  into the arctic or desert).
+
+--Heat overhaul:  changed the mechanisms of fever.  Instead of heat produced by
+  a held object (same as holding a hot coal or whatever), where it would be
+  modulated by clothing R value (or in the old system, contained by it), heat
+  from fever is a separate quantity that gets added in after all head
+  computations for player.  Thermal shock reduction, based on clothing, is
+  also disabled when you have a fever (so there's no punishment for wearing
+  clothes when you head to the snow to cool the fever off).
+
 
 
 

@@ -256,6 +256,7 @@ typedef struct LiveObject {
         // held by other player?
         char heldByOther;
         int heldByOtherID;
+        char everHeldByParent;
 
         // player that's responsible for updates that happen to this
         // player during current step
@@ -407,6 +408,11 @@ typedef struct LiveObject {
         float bodyHeat;
         
 
+        // used track current biome heat for biome-change shock effects
+        float biomeHeat;
+        float lastBiomeHeat;
+
+
         // body heat normalized to [0,1], with targetHeat at 0.5
         float heat;
         
@@ -421,6 +427,9 @@ typedef struct LiveObject {
         int foodStore;
         
         double foodCapModifier;
+
+        double fever;
+        
 
         // wall clock time when we should decrement the food store
         double foodDecrementETASeconds;
@@ -961,8 +970,10 @@ static void deleteMembers( FreshConnection *inConnection ) {
     delete inConnection->sock;
     delete inConnection->sockBuffer;
     
-    delete [] inConnection->sequenceNumberString;
-
+    if( inConnection->sequenceNumberString != NULL ) {    
+        delete [] inConnection->sequenceNumberString;
+        }
+    
     if( inConnection->ticketServerRequest != NULL ) {
         delete inConnection->ticketServerRequest;
         }
@@ -1008,8 +1019,16 @@ void quitCleanup() {
 
     for( int i=0; i<players.size(); i++ ) {
         LiveObject *nextPlayer = players.getElement(i);
-        delete nextPlayer->sock;
-        delete nextPlayer->sockBuffer;
+
+        if( nextPlayer->sock != NULL ) {
+            delete nextPlayer->sock;
+            nextPlayer->sock = NULL;
+            }
+        if( nextPlayer->sockBuffer != NULL ) {
+            delete nextPlayer->sockBuffer;
+            nextPlayer->sockBuffer = NULL;
+            }
+
         delete nextPlayer->lineage;
 
         if( nextPlayer->name != NULL ) {
@@ -1198,6 +1217,19 @@ char *getNextClientMessage( SimpleVector<char> *inBuffer ) {
     int index = inBuffer->getElementIndex( '#' );
         
     if( index == -1 ) {
+
+        if( inBuffer->size() > 200 ) {
+            // 200 characters with no message terminator?
+            // client is sending us nonsense
+            // cut it off here to avoid buffer overflow
+            
+            AppLog::info( "More than 200 characters in client receive buffer "
+                          "with no messsage terminator present, "
+                          "generating NONSENSE message." );
+            
+            return stringDuplicate( "NONSENSE 0 0" );
+            }
+
         return NULL;
         }
     
@@ -1981,6 +2013,14 @@ static double distance( GridPos inA, GridPos inB ) {
     }
 
 
+
+static float sign( float inF ) {
+    if (inF > 0) return 1;
+    if (inF < 0) return -1;
+    return 0;
+    }
+
+
 // how often do we check what a player is standing on top of for attack effects?
 static double playerCrossingCheckStepTime = 0.25;
 
@@ -2362,8 +2402,6 @@ static void recomputeHeatMap( LiveObject *inPlayer ) {
             }
         }
     
-    printf( "\n###### %d in airspace\n\n", numInAirspace );
-
     
     float rBoundarySum = 0;
     int rBoundarySize = 0;
@@ -2404,11 +2442,19 @@ static void recomputeHeatMap( LiveObject *inPlayer ) {
     
     // floor counts as boundary too
     // 4x its effect (seems more important than one of 8 walls
+    
+    // count non-air floor tiles while we're at it
+    int numFloorTilesInAirspace = 0;
+
     if( numInAirspace > 0 ) {
         for( int i=0; i<gridSize; i++ ) {
             if( airSpaceGrid[i] ) {
                 rBoundarySum += 4 * rFloorGrid[i];
                 rBoundarySize += 4;
+                
+                if( rFloorGrid[i] > rAir ) {
+                    numFloorTilesInAirspace++;
+                    }
                 }
             }
         }
@@ -2425,8 +2471,6 @@ static void recomputeHeatMap( LiveObject *inPlayer ) {
     
 
 
-    printf( "Boundary contains %d tiles with average r of %f\n", rBoundarySize,
-            rBoundaryAverage );
 
     float airSpaceHeatSum = 0;
     
@@ -2446,10 +2490,6 @@ static void recomputeHeatMap( LiveObject *inPlayer ) {
 
     float containedAirSpaceHeatVal = airSpaceHeatVal * rBoundaryAverage;
     
-    printf( "Total heat in airspace = %f, spread over %d tiles = %f, "
-            "insulated by %f = %f\n",
-            airSpaceHeatSum, numInAirspace, airSpaceHeatVal,
-            rBoundaryAverage, containedAirSpaceHeatVal );
 
 
     float radiantAirSpaceHeatVal = 0;
@@ -2472,26 +2512,55 @@ static void recomputeHeatMap( LiveObject *inPlayer ) {
             double d = distance( playerHeatMapPos, heatPos );
             
             // avoid infinite heat when player standing on source
-            d += 1;
-            
 
-            radiantAirSpaceHeatVal += heatOutputGrid[ i ] / ( d * d );
+            radiantAirSpaceHeatVal += heatOutputGrid[ i ] / ( 1.5 * d + 1 );
             numRadiantHeatSources ++;
             }
         }
     
-    printf( "%d radiant heat sources in airspace (total = %f)\n", 
-            numRadiantHeatSources, radiantAirSpaceHeatVal );
 
     float biomeHeatWeight = 1;
     float radiantHeatWeight = 1;
     
     float containedHeatWeight = 4;
 
+
+    // boundary r-value also limits affect of biome heat on player's
+    // environment... keeps biome "out"
+    float boundaryLeak = 1 - rBoundaryAverage;
+
+    if( numFloorTilesInAirspace != numInAirspace ) {
+        // biome heat invades airspace if entire thing isn't covered by
+        // a floor (not really indoors)
+        boundaryLeak = 1;
+        }
+
+
+    // a hot biome only pulls us up above perfect
+    // (hot biome leaking into a building can never make the building
+    //  just right).
+    // Enclosed walls can make a hot biome not as hot, but never cool
+    float biomeHeat = getBiomeHeatValue( getMapBiome( pos.x, pos.y ) );
+    
+    if( biomeHeat > targetHeat ) {
+        biomeHeat = boundaryLeak * (biomeHeat - targetHeat) + targetHeat;
+        }
+    else if( biomeHeat < 0 ) {
+        // a cold biome's coldness is modulated directly by walls, however
+        biomeHeat = boundaryLeak * biomeHeat;
+        }
+    
+    // small offset to ensure that naked-on-green biome the same
+    // in new heat model as old
+    float constHeatValue = 1.1;
+
     inPlayer->envHeat = 
         radiantHeatWeight * radiantAirSpaceHeatVal + 
         containedHeatWeight * containedAirSpaceHeatVal +
-        biomeHeatWeight * getBiomeHeatValue( getMapBiome( pos.x, pos.y ) );
+        biomeHeatWeight * biomeHeat +
+        constHeatValue;
+
+    inPlayer->biomeHeat = biomeHeat + constHeatValue;
     }
 
 
@@ -2769,17 +2838,28 @@ static void setPlayerDisconnected( LiveObject *inPlayer,
     
     // just mark them as not connected
 
-    AppLog::infoF( "Player %d (%s) marked as disconnected.",
-                   inPlayer->id, inPlayer->email );
+    AppLog::infoF( "Player %d (%s) marked as disconnected (%s).",
+                   inPlayer->id, inPlayer->email, inReason );
     inPlayer->connected = false;
 
     // when player reconnects, they won't get a force PU message
     // so we shouldn't be waiting for them to ack
     inPlayer->waitingForForceResponse = false;
 
-    // also, stop polling their socket, which will trigger constant
-    // socket events from here on out, and cause us to busy-loop
-    sockPoll.removeSocket( inPlayer->sock );
+    
+    
+    if( inPlayer->sock != NULL ) {
+        // also, stop polling their socket, which will trigger constant
+        // socket events from here on out, and cause us to busy-loop
+        sockPoll.removeSocket( inPlayer->sock );
+
+        delete inPlayer->sock;
+        inPlayer->sock = NULL;
+        }
+    if( inPlayer->sockBuffer != NULL ) {
+        delete inPlayer->sockBuffer;
+        inPlayer->sockBuffer = NULL;
+        }
     }
 
 
@@ -4324,8 +4404,14 @@ int processLoggedInPlayer( Socket *inSock,
 
             
             // give them this new socket and buffer
-            delete o->sock;
-            delete o->sockBuffer;
+            if( o->sock != NULL ) {
+                delete o->sock;
+                o->sock = NULL;
+                }
+            if( o->sockBuffer != NULL ) {
+                delete o->sockBuffer;
+                o->sockBuffer = NULL;
+                }
             
             o->sock = inSock;
             o->sockBuffer = inSockBuffer;
@@ -4416,7 +4502,9 @@ int processLoggedInPlayer( Socket *inSock,
     
 
     newObject.heldByOther = false;
-                            
+    newObject.everHeldByParent = false;
+    
+
     int numOfAge = 0;
                             
     int numPlayers = players.size();
@@ -4605,6 +4693,8 @@ int processLoggedInPlayer( Socket *inSock,
 
     newObject.foodCapModifier = 1.0;
 
+    newObject.fever = 0;
+
     // start full up to capacity with food
     newObject.foodStore = computeFoodCapacity( &newObject );
 
@@ -4623,6 +4713,8 @@ int processLoggedInPlayer( Socket *inSock,
 
     newObject.envHeat = targetHeat;
     newObject.bodyHeat = targetHeat;
+    newObject.biomeHeat = targetHeat;
+    newObject.lastBiomeHeat = targetHeat;
     newObject.heat = 0.5;
     newObject.heatUpdate = false;
     newObject.lastHeatUpdate = Time::getCurrentTime();
@@ -6755,12 +6847,15 @@ typedef struct ForcedEffects {
         
         char foodModifierSet;
         double foodCapModifier;
+        
+        char feverSet;
+        float fever;
     } ForcedEffects;
         
 
 
 ForcedEffects checkForForcedEffects( int inHeldObjectID ) {
-    ForcedEffects e = { -1, 0, false, 1.0 };
+    ForcedEffects e = { -1, 0, false, 1.0, false, 0.0f };
     
     ObjectRecord *o = getObject( inHeldObjectID );
     
@@ -6779,6 +6874,16 @@ ForcedEffects checkForForcedEffects( int inHeldObjectID ) {
                                   &( e.foodCapModifier ) );
             if( numRead == 1 ) {
                 e.foodModifierSet = true;
+                }
+            }
+
+        char *feverPos = strstr( o->description, "fever_" );
+        
+        if( feverPos != NULL ) {
+            int numRead = sscanf( feverPos, "fever_%f", 
+                                  &( e.fever ) );
+            if( numRead == 1 ) {
+                e.feverSet = true;
                 }
             }
         }
@@ -6810,6 +6915,8 @@ void setNoLongerDying( LiveObject *inPlayer,
     inPlayer->emotFrozen = false;
     inPlayer->foodCapModifier = 1.0;
     inPlayer->foodUpdate = true;
+
+    inPlayer->fever = 0;
 
     if( inPlayer->deathReason 
         != NULL ) {
@@ -7616,6 +7723,9 @@ int main() {
                             
                             delete nextConnection->ticketServerRequest;
                             nextConnection->ticketServerRequest = NULL;
+
+                            delete [] nextConnection->sequenceNumberString;
+                            nextConnection->sequenceNumberString = NULL;
                             
                             if( nextConnection->twinCode != NULL
                                 && 
@@ -7635,8 +7745,7 @@ int main() {
                                     nextConnection->tutorialNumber,
                                     nextConnection->curseStatus );
                                 }
-                            
-                            delete [] nextConnection->sequenceNumberString;
+                                                        
                             newConnections.deleteElement( i );
                             i--;
                             }
@@ -7842,7 +7951,12 @@ int main() {
                                     
                                     delete nextConnection->ticketServerRequest;
                                     nextConnection->ticketServerRequest = NULL;
-                            
+                                    
+                                    delete [] 
+                                        nextConnection->sequenceNumberString;
+                                    nextConnection->sequenceNumberString = NULL;
+
+
                                     if( nextConnection->twinCode != NULL
                                         && 
                                         nextConnection->twinCount > 0 ) {
@@ -7861,9 +7975,7 @@ int main() {
                                             nextConnection->tutorialNumber,
                                             nextConnection->curseStatus );
                                         }
-                                    
-                                    delete [] 
-                                        nextConnection->sequenceNumberString;
+                                                                        
                                     newConnections.deleteElement( i );
                                     i--;
                                     }
@@ -7956,7 +8068,9 @@ int main() {
                                    "(cause: %s)",
                                    nextConnection->errorCauseString );
 
-                    sockPoll.removeSocket( nextConnection->sock );
+                    if( nextConnection->sock != NULL ) {
+                        sockPoll.removeSocket( nextConnection->sock );
+                        }
                     
                     deleteMembers( nextConnection );
                     
@@ -8292,6 +8406,9 @@ int main() {
                                         e.foodCapModifier;
                                     nextPlayer->foodUpdate = true;
                                     }
+                                if( e.feverSet ) {
+                                    nextPlayer->fever = e.fever;
+                                    }
                             
 
                                 playerIndicesToSendUpdatesAbout.
@@ -8364,11 +8481,8 @@ int main() {
                 if( m.type == UNKNOWN ) {
                     AppLog::info( "Client error, unknown message type." );
                     
-                    setDeathReason( nextPlayer, "unknown_message" );
-
-                    nextPlayer->error = true;
-                    nextPlayer->errorCauseString =
-                        "Unknown message type";
+                    setPlayerDisconnected( nextPlayer, 
+                                           "Unknown message type" );
                     }
 
                 //Thread::staticSleep( 
@@ -8498,10 +8612,7 @@ int main() {
                     delete [] message;
                     }
                 else if( m.type == DIE ) {
-                    if( computeAge( nextPlayer ) < 1 &&
-                        nextPlayer->heldByOther &&
-                        nextPlayer->heldByOtherID == 
-                        nextPlayer->parentID ) {
+                    if( computeAge( nextPlayer ) < 2 ) {
                         
                         // killed self
                         // SID triggers a lineage ban
@@ -8511,14 +8622,27 @@ int main() {
 
                         nextPlayer->error = true;
                         nextPlayer->errorCauseString = "Baby suicide";
-                        int parentID = nextPlayer->heldByOtherID;
+                        int parentID = nextPlayer->parentID;
                         
-                        LiveObject *parent = 
+                        LiveObject *parentO = 
                             getLiveObject( parentID );
                         
-                        if( parent != NULL ) {
+                        if( parentO != NULL && nextPlayer->everHeldByParent ) {
+                            // mother picked up this SID baby at least
+                            // one time
                             // mother can have another baby right away
-                            parent->birthCoolDown = 0;
+                            parentO->birthCoolDown = 0;
+                            }
+                        
+                        
+                        int holdingAdultID = nextPlayer->heldByOtherID;
+
+                        LiveObject *adult = NULL;
+                        if( nextPlayer->heldByOther ) {
+                            adult = getLiveObject( holdingAdultID );
+                            }
+
+                        if( adult != NULL ) {
                             
                             int babyBonesID = 
                                 SettingsManager::getIntSetting( 
@@ -8533,20 +8657,20 @@ int main() {
                                     // don't leave grave on ground just yet
                                     nextPlayer->customGraveID = 0;
                             
-                                    GridPos parentPos = 
-                                        getPlayerPos( parent );
+                                    GridPos adultPos = 
+                                        getPlayerPos( adult );
 
                                     // put invisible grave there for now
-                                    GraveInfo graveInfo = { parentPos, 
+                                    GraveInfo graveInfo = { adultPos, 
                                                             nextPlayer->id };
                                     newGraves.push_back( graveInfo );
                                     
-                                    parent->heldGraveOriginX = parentPos.x;
+                                    adult->heldGraveOriginX = adultPos.x;
                                     
-                                    parent->heldGraveOriginY = parentPos.y;
+                                    adult->heldGraveOriginY = adultPos.y;
                                  
                                     playerIndicesToSendUpdatesAbout.push_back(
-                                        getLiveObjectIndex( parentID ) );
+                                        getLiveObjectIndex( holdingAdultID ) );
                                     
                                     // what if baby wearing clothes?
                                     for( int c=0; 
@@ -8557,52 +8681,52 @@ int main() {
                                             nextPlayer->clothing, c );
                                         
                                         if( cObj != NULL ) {
-                                            // put clothing in parent's hand
+                                            // put clothing in adult's hand
                                             // and then drop
-                                            parent->holdingID = cObj->id;
+                                            adult->holdingID = cObj->id;
                                             if( nextPlayer->
                                                 clothingContained[c].
                                                 size() > 0 ) {
                                                 
-                                                parent->numContained =
+                                                adult->numContained =
                                                     nextPlayer->
                                                     clothingContained[c].
                                                     size();
                                                 
-                                                parent->containedIDs =
+                                                adult->containedIDs =
                                                     nextPlayer->
                                                     clothingContained[c].
                                                     getElementArray();
-                                                parent->containedEtaDecays =
+                                                adult->containedEtaDecays =
                                                     nextPlayer->
                                                     clothingContainedEtaDecays
                                                     [c].
                                                     getElementArray();
                                                 
-                                                parent->subContainedIDs
+                                                adult->subContainedIDs
                                                     = new 
                                                     SimpleVector<int>[
-                                                    parent->numContained ];
-                                                parent->subContainedEtaDecays
+                                                    adult->numContained ];
+                                                adult->subContainedEtaDecays
                                                     = new 
                                                     SimpleVector<timeSec_t>[
-                                                    parent->numContained ];
+                                                    adult->numContained ];
                                                 }
                                             
                                             handleDrop( 
-                                                parentPos.x, parentPos.y, 
-                                                parent,
+                                                adultPos.x, adultPos.y, 
+                                                adult,
                                                 NULL );
                                             }
                                         }
                                     
                                     // finally leave baby bones
                                     // in their hands
-                                    parent->holdingID = babyBonesID;
+                                    adult->holdingID = babyBonesID;
                                     
                                     // this works to force client to play
                                     // creation sound for baby bones.
-                                    parent->heldTransitionSourceID = 
+                                    adult->heldTransitionSourceID = 
                                         nextPlayer->displayID;
                                     
                                     nextPlayer->heldByOther = false;
@@ -9579,6 +9703,11 @@ int main() {
                                                     hitPlayer->foodUpdate = 
                                                         true;
                                                     }
+                                                
+                                                if( e.feverSet ) {
+                                                    hitPlayer->fever = e.fever;
+                                                    }
+
 
                                                 playerIndicesToSendUpdatesAbout.
                                                     push_back( 
@@ -10439,6 +10568,12 @@ int main() {
                                     hitPlayer->heldByOther = true;
                                     hitPlayer->heldByOtherID = nextPlayer->id;
                                     
+                                    if( hitPlayer->heldByOtherID ==
+                                        hitPlayer->parentID ) {
+                                        hitPlayer->everHeldByParent = true;
+                                        }
+                                    
+
                                     // force baby to drop what they are
                                     // holding
 
@@ -10745,6 +10880,9 @@ int main() {
                                             targetPlayer->foodCapModifier = 
                                                 e.foodCapModifier;
                                             targetPlayer->foodUpdate = true;
+                                            }
+                                        if( e.feverSet ) {
+                                            targetPlayer->fever = e.fever;
                                             }
                                         }
                                     }
@@ -11648,8 +11786,10 @@ int main() {
                     nextPlayer->error = false;
                     }
                 else {
-                    // stop listening for activity on this socket
-                    sockPoll.removeSocket( nextPlayer->sock );
+                    if( nextPlayer->sock != NULL ) {
+                        // stop listening for activity on this socket
+                        sockPoll.removeSocket( nextPlayer->sock );
+                        }
                     }
                 
 
@@ -12878,9 +13018,22 @@ int main() {
                 continue;
                 }
             
+            // in case we cross a biome boundary since last time
+            // there will be thermal shock that will take them to
+            // other side of target temp.
+            // 
+            // but never make them more comfortable (closer to
+            // target) then they were before
+            float oldDiffFromTarget = 
+                targetHeat - nextPlayer->bodyHeat;
+
+
             
             // body produces its own heat
-            nextPlayer->bodyHeat += 1;
+            // but only in a cold env
+            if( nextPlayer->envHeat < targetHeat ) {
+                nextPlayer->bodyHeat += 0.25;
+                }
 
             nextPlayer->bodyHeat += computeClothingHeat( nextPlayer );
 
@@ -12892,11 +13045,90 @@ int main() {
             float heatDelta = 
                 clothingLeak * ( nextPlayer->envHeat - nextPlayer->bodyHeat );
 
-            nextPlayer->bodyHeat += heatDelta;
+            // slow this down a bit
+            heatDelta *= 0.5;
             
+            // feed through curve that is asymtotic at 1
+            // (so we never change heat faster than 1 unit per timestep)
+            
+            float heatDeltaAbs = fabs( heatDelta );
+            float heatDeltaSign = sign( heatDelta );
+
+            float maxDelta = 2;
+            // larger values make a sharper "knee"
+            float deltaSlope = 0.5;
+            
+            // max - max/(slope*x+1)
+            
+            float heatDeltaScaled = 
+                maxDelta - maxDelta / ( deltaSlope * heatDeltaAbs + 1 );
+            
+            heatDeltaScaled *= heatDeltaSign;
+
+
+            nextPlayer->bodyHeat += heatDeltaScaled;
+            
+  
+            if( nextPlayer->lastBiomeHeat != nextPlayer->biomeHeat ) {
+                
+          
+                float lastBiomeDiffFromTarget = 
+                    targetHeat - nextPlayer->lastBiomeHeat;
+            
+                float biomeDiffFromTarget = targetHeat - nextPlayer->biomeHeat;
+            
+                // for any biome
+                // there's a "shock" when you enter it, if it's heat value
+                // is on the other side of "perfect" from the last biome
+                // you were in.
+                if( lastBiomeDiffFromTarget != 0 &&
+                    biomeDiffFromTarget != 0 &&
+                    sign( lastBiomeDiffFromTarget ) != 
+                    sign( biomeDiffFromTarget ) ) {
+                
+                    // modulate this shock by clothing
+
+                    // but only if player does not have fever
+                    // we don't want to punish them for wearing clothes
+                    // if they get a fever
+                    if( nextPlayer->fever == 0 ) {
+                        nextPlayer->bodyHeat = 
+                            targetHeat - clothingLeak * biomeDiffFromTarget;
+                        
+                        float newDiffFromTarget =
+                            targetHeat - nextPlayer->bodyHeat;
+                        
+                        float oldAbs = fabs( oldDiffFromTarget );
+                        
+                        if( fabs( newDiffFromTarget ) < 
+                            oldAbs ) {
+                            // they used crossing boundary to become more
+                            // comfortable
+                            
+                            // force them to be no more comfortable than
+                            // they used to be
+                            nextPlayer->bodyHeat = 
+                                targetHeat - 
+                                sign( newDiffFromTarget ) * oldAbs;
+                            }
+
+                        }
+                    else {
+                        // direct shock, as if unclothed
+                        float airLeak = 1 - rAir;
+                        nextPlayer->bodyHeat = 
+                            targetHeat - airLeak * biomeDiffFromTarget;
+                        }
+                    }
+
+                // we've handled this shock
+                nextPlayer->lastBiomeHeat = nextPlayer->biomeHeat;
+                }
+            
+            float totalBodyHeat = nextPlayer->bodyHeat + nextPlayer->fever;
             
             // convert into 0..1 range, where 0.5 represents targetHeat
-            nextPlayer->heat = ( nextPlayer->bodyHeat / targetHeat ) / 2;
+            nextPlayer->heat = ( totalBodyHeat / targetHeat ) / 2;
             if( nextPlayer->heat > 1 ) {
                 nextPlayer->heat = 1;
                 }
@@ -14814,11 +15046,19 @@ int main() {
 
                 AppLog::infoF( "%d remaining player(s) alive on server ",
                                players.size() - 1 );
-
-                sockPoll.removeSocket( nextPlayer->sock );
                 
-                delete nextPlayer->sock;
-                delete nextPlayer->sockBuffer;
+                if( nextPlayer->sock != NULL ) {
+                    sockPoll.removeSocket( nextPlayer->sock );
+                
+                    delete nextPlayer->sock;
+                    nextPlayer->sock = NULL;
+                    }
+                
+                if( nextPlayer->sockBuffer != NULL ) {
+                    delete nextPlayer->sockBuffer;
+                    nextPlayer->sockBuffer = NULL;
+                    }
+                
                 delete nextPlayer->lineage;
                 
                 if( nextPlayer->name != NULL ) {
